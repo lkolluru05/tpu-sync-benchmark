@@ -1,0 +1,247 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: tpu-sync-headless
+  namespace: default
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    app: tpu-sync-v5e32
+  ports:
+    - name: tpu-ici
+      port: 8471
+    - name: jax-coord
+      port: 10001
+    - name: raiden-ctrl
+      port: 50051
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: tpu-sync-source5
+  namespace: default
+spec:
+  parallelism: 8
+  completions: 8
+  completionMode: Indexed
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app: tpu-sync-v5e32
+        role: source
+    spec:
+      subdomain: tpu-sync-headless
+      dnsPolicy: ClusterFirst
+      hostAliases:
+        - ip: 169.254.169.254
+          hostnames:
+            - metadata
+            - metadata.google.internal
+      nodeSelector:
+        cloud.google.com/gke-nodepool: aireen-pw-v5e-32-np-1
+        cloud.google.com/gke-tpu-accelerator: tpu-v5-lite-podslice
+        cloud.google.com/gke-tpu-topology: 4x8
+      volumes:
+        - name: script-vol
+          configMap:
+            name: tpu-sync-jax-script
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 64Gi
+      containers:
+        - name: jax-source
+          image: us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: tpu-ici
+              containerPort: 8471
+            - name: jax-coord
+              containerPort: 10001
+            - name: raiden-ctrl
+              containerPort: 50051
+          securityContext:
+            privileged: true
+          volumeMounts:
+            - name: script-vol
+              mountPath: /scripts
+            - name: dshm
+              mountPath: /dev/shm
+          env:
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: TPU_SKIP_MDS_QUERY
+              value: "1"
+            - name: TPU_CHIPS_PER_HOST_BOUNDS
+              value: "2,2,1"
+            - name: TPU_HOST_BOUNDS
+              value: "2,4,1"
+            - name: JAX_PJRT_CLIENT_CREATE_OPTIONS
+              value: "pinned_host_allocation_mode:recycle"
+            - name: LIBTPU_INIT_ARGS
+              value: "--slicebuilder_use_insecure_grpc=true --undefok=slicebuilder_use_insecure_grpc --xla_tpu_spmd_rng_bit_generator_unsafe=1 --xla_tpu_enable_latency_hiding_scheduler=true --xla_tpu_perform_spmd_cse_prevention=false"
+            - name: TPU_MIN_LOG_LEVEL
+              value: "0"
+            - name: TPU_STDERR_LOG_LEVEL
+              value: "0"
+          command: ["/bin/bash", "-lc"]
+          args:
+            - |
+              set -euo pipefail
+              echo "[$(date -u +%H:%M:%S)] [SOURCE rank=${JOB_COMPLETION_INDEX}] YAML STAGE 1/4: Booted on $(hostname) ($(hostname -I | awk '{print $1}')), TPU_WORKER_ID=${TPU_WORKER_ID:-unset}"
+
+              echo "[$(date -u +%H:%M:%S)] [SOURCE rank=${JOB_COMPLETION_INDEX}] YAML STAGE 2/4: Installing pinned JAX 0.11.2 + tpu-sync-jax..."
+              if ! ldconfig -p | grep -q libibverbs.so.1; then
+                apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends libibverbs1
+              fi
+              pip install --progress-bar off \
+                "jax==0.11.2" "jaxlib==0.11.2" "libtpu==0.0.48" \
+                "tpu-info==0.7.1" "absl-py" "numpy" "requests" \
+                "grpcio>=1.65.5" "protobuf>=6.33.5,<7"
+              pip install --progress-bar off --pre --no-deps tpu-sync-jax
+              python3 -c "import jax, tpu_sync.api.jax.weight_synchronizer, tpu_sync.frameworks.jax.utils, tpu_sync.rpc.raiden_controller; print('Verified all imports -> jax:', jax.__version__)"
+
+              echo "[$(date -u +%H:%M:%S)] [SOURCE rank=${JOB_COMPLETION_INDEX}] YAML STAGE 3/4: Verifying /scripts mount..."
+              ls -lh /scripts/jax_nodepool_weight_sync.py
+
+              echo "[$(date -u +%H:%M:%S)] [SOURCE rank=${JOB_COMPLETION_INDEX}] YAML STAGE 4/4: Launching jax_nodepool_weight_sync.py..."
+              python3 -u /scripts/jax_nodepool_weight_sync.py \
+                --role=source \
+                --controller_address="tpu-sync-source5-0.tpu-sync-headless.default.svc.cluster.local:50051" \
+                --jax_coordinator="tpu-sync-source5-0.tpu-sync-headless.default.svc.cluster.local:10001" \
+                --num_processes=8 \
+                --process_id="${JOB_COMPLETION_INDEX}" \
+                --src_mesh="4,8" \
+                --dst_mesh="8,4" \
+                --num_vars=16 \
+                --var_shape="8192,8192" \
+                --dtype="bfloat16" \
+                --parallelism=8 \
+                --num_iters=5
+          resources:
+            requests:
+              google.com/tpu: "4"
+              memory: "120Gi"
+              cpu: "24"
+            limits:
+              google.com/tpu: "4"
+              memory: "120Gi"
+              cpu: "24"
+      restartPolicy: Never
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: tpu-sync-dest5
+  namespace: default
+spec:
+  parallelism: 8
+  completions: 8
+  completionMode: Indexed
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app: tpu-sync-v5e32
+        role: destination
+    spec:
+      subdomain: tpu-sync-headless
+      dnsPolicy: ClusterFirst
+      hostAliases:
+        - ip: 169.254.169.254
+          hostnames:
+            - metadata
+            - metadata.google.internal
+      nodeSelector:
+        cloud.google.com/gke-nodepool: aireen-pw-v5e-32-np-2
+        cloud.google.com/gke-tpu-accelerator: tpu-v5-lite-podslice
+        cloud.google.com/gke-tpu-topology: 4x8
+      volumes:
+        - name: script-vol
+          configMap:
+            name: tpu-sync-jax-script
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 64Gi
+      containers:
+        - name: jax-destination
+          image: us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: tpu-ici
+              containerPort: 8471
+            - name: jax-coord
+              containerPort: 10001
+            - name: raiden-ctrl
+              containerPort: 50051
+          securityContext:
+            privileged: true
+          volumeMounts:
+            - name: script-vol
+              mountPath: /scripts
+            - name: dshm
+              mountPath: /dev/shm
+          env:
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: TPU_SKIP_MDS_QUERY
+              value: "1"
+            - name: TPU_CHIPS_PER_HOST_BOUNDS
+              value: "2,2,1"
+            - name: TPU_HOST_BOUNDS
+              value: "2,4,1"
+            - name: JAX_PJRT_CLIENT_CREATE_OPTIONS
+              value: "pinned_host_allocation_mode:recycle"
+            - name: LIBTPU_INIT_ARGS
+              value: "--slicebuilder_use_insecure_grpc=true --undefok=slicebuilder_use_insecure_grpc --xla_tpu_spmd_rng_bit_generator_unsafe=1 --xla_tpu_enable_latency_hiding_scheduler=true --xla_tpu_perform_spmd_cse_prevention=false"
+            - name: TPU_MIN_LOG_LEVEL
+              value: "0"
+            - name: TPU_STDERR_LOG_LEVEL
+              value: "0"
+          command: ["/bin/bash", "-lc"]
+          args:
+            - |
+              set -euo pipefail
+              echo "[$(date -u +%H:%M:%S)] [DEST rank=${JOB_COMPLETION_INDEX}] YAML STAGE 1/4: Booted on $(hostname) ($(hostname -I | awk '{print $1}')), TPU_WORKER_ID=${TPU_WORKER_ID:-unset}"
+
+              echo "[$(date -u +%H:%M:%S)] [DEST rank=${JOB_COMPLETION_INDEX}] YAML STAGE 2/4: Installing pinned JAX 0.11.2 + tpu-sync-jax..."
+              if ! ldconfig -p | grep -q libibverbs.so.1; then
+                apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends libibverbs1
+              fi
+              pip install --progress-bar off \
+                "jax==0.11.2" "jaxlib==0.11.2" "libtpu==0.0.48" \
+                "tpu-info==0.7.1" "absl-py" "numpy" "requests" \
+                "grpcio>=1.65.5" "protobuf>=6.33.5,<7"
+              pip install --progress-bar off --pre --no-deps tpu-sync-jax
+              python3 -c "import jax, tpu_sync.api.jax.weight_synchronizer, tpu_sync.frameworks.jax.utils, tpu_sync.rpc.raiden_controller; print('Verified all imports -> jax:', jax.__version__)"
+
+              echo "[$(date -u +%H:%M:%S)] [DEST rank=${JOB_COMPLETION_INDEX}] YAML STAGE 3/4: Verifying /scripts mount..."
+              ls -lh /scripts/jax_nodepool_weight_sync.py
+
+              echo "[$(date -u +%H:%M:%S)] [DEST rank=${JOB_COMPLETION_INDEX}] YAML STAGE 4/4: Launching jax_nodepool_weight_sync.py..."
+              python3 -u /scripts/jax_nodepool_weight_sync.py \
+                --role=destination \
+                --controller_address="tpu-sync-source5-0.tpu-sync-headless.default.svc.cluster.local:50051" \
+                --jax_coordinator="tpu-sync-dest5-0.tpu-sync-headless.default.svc.cluster.local:10001" \
+                --num_processes=8 \
+                --process_id="${JOB_COMPLETION_INDEX}" \
+                --src_mesh="4,8" \
+                --dst_mesh="8,4" \
+                --num_vars=16 \
+                --var_shape="8192,8192" \
+                --dtype="bfloat16" \
+                --parallelism=8 \
+                --num_iters=5
+          resources:
+            requests:
+              google.com/tpu: "4"
+              memory: "120Gi"
+              cpu: "24"
+            limits:
+              google.com/tpu: "4"
+              memory: "120Gi"
+              cpu: "24"
+      restartPolicy: Never
